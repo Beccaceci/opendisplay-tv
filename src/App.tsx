@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react"
 import { AnimatePresence, motion } from "motion/react"
 import Showcase from "./components/Showcase"
 import SiteFooter from "./components/SiteFooter"
-import SupportNudge from "./components/SupportNudge"
 import TextRotate from "./components/TextRotate"
 
 const APP_STORE_URL = "https://apps.apple.com/us/app/opendisplay/id6780264891"
@@ -172,8 +171,6 @@ export default function App() {
         </div>
       </nav>
 
-      {/* Sticky-scope: the Ko-fi bar sticks under the nav through the hero and
-          demo, then releases where this div ends — right before #support. */}
       <div className="nudge-scope">
       <section>
         <div className="wrap hero">
@@ -208,10 +205,6 @@ export default function App() {
           <p className="meta">macOS 14+ &nbsp;·&nbsp; iPadOS 15+ &nbsp;·&nbsp; iOS 15+ &nbsp;·&nbsp; Android 7.0+ (beta) &nbsp;·&nbsp; Receiver Mac 12+ &nbsp;·&nbsp; Linux sender (beta) &nbsp;·&nbsp; Linux receiver (beta) &nbsp;·&nbsp; GPL-3.0</p>
         </div>
       </section>
-
-      {/* Full-width Ko-fi bar between the hero pitch and the downloads. It sits
-          in flow here and pins under the nav once you scroll past it. */}
-      <SupportNudge />
 
       <section className="downloads-sec">
         <div className="wrap">
@@ -355,39 +348,6 @@ export default function App() {
         </div>
       </section>
       </div>
-
-      <section id="support">
-        <div className="wrap sec support">
-          <p className="eyebrow">Support the project</p>
-          <img className="kofi-logo" src="kofi-logo.png" alt="Ko-fi" width="200" height="61" />
-          <h2>If OpenDisplay saved you a monitor, consider buying me a coffee.</h2>
-          <div className="support-note">
-            <p>
-              OpenDisplay is a one-person labour of love, built and maintained by me,
-              Philip. It's not a company. It's just me.
-            </p>
-            <p>
-              It's free, open source, and funded out of my own pocket. The fixed costs
-              are modest but real: <strong>$99 a year</strong> for the Apple Developer
-              membership behind the signed, one-click installs, and <strong>$11 a year</strong>{" "}
-              for the domain. On top of that go a lot of unpaid evenings and weekends.
-            </p>
-            <p>
-              Supporting me on Ko-fi keeps OpenDisplay well maintained and free for
-              everyone, including the people who can't afford to chip in. My goal is to
-              make this the greatest display companion app there is for iPad.
-            </p>
-            <p>
-              If it saved you from buying a monitor, a small tip helps keep it going.
-              Thank you.
-            </p>
-          </div>
-          <a className="btn kofi" href="https://ko-fi.com/peetzweg">
-            <img className="kofi-mark" src="kofi-mark.webp" alt="" width="28" height="28" />
-            Support on Ko-fi
-          </a>
-        </div>
-      </section>
 
       <section id="features">
         <div className="wrap sec">

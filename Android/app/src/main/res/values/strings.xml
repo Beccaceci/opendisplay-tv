@@ -48,6 +48,5 @@
     <string name="section_about">About</string>
     <string name="row_version">Version</string>
     <string name="link_website">OpenDisplay.app</string>
-    <string name="link_github">GitHub: peetzweg/opendisplay</string>
-    <string name="link_kofi">Support OpenDisplay on Ko-fi</string>
+    <string name="link_github">GitHub: Beccaceci/opendisplay-tv</string>
 </resources>

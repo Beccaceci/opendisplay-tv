@@ -9,8 +9,7 @@ export default function SiteFooter({ base = "" }: { base?: string }) {
           <a href="https://github.com/peetzweg/opendisplay">GitHub</a>
           <a href="https://github.com/peetzweg/opendisplay/releases/latest">Releases</a>
           <a href={`${base}docs/`}>Docs</a>
-          <a href="https://github.com/peetzweg/opendisplay/issues">Issues</a>
-          <a href="https://ko-fi.com/peetzweg">Support / Ko-fi</a>
+          <a href="https://github.com/Beccaceci/opendisplay-tv/issues">Issues</a>
           <a href={`${base}privacy.html`}>Privacy</a>
           <a href="https://github.com/peetzweg/opendisplay/blob/main/LICENSE">GPL-3.0 License</a>
         </div>

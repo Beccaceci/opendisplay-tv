@@ -446,11 +446,8 @@ struct SettingsView: View {
                     Link(destination: URL(string: "https://opendisplay.app")!) {
                         Label("OpenDisplay.app", systemImage: "globe")
                     }
-                    Link(destination: URL(string: "https://github.com/peetzweg/opendisplay")!) {
-                        Label("GitHub: peetzweg/opendisplay", systemImage: "link")
-                    }
-                    Link(destination: URL(string: "https://ko-fi.com/peetzweg")!) {
-                        Label("Support OpenDisplay on Ko-fi", systemImage: "cup.and.saucer")
+                    Link(destination: URL(string: "https://github.com/Beccaceci/opendisplay-tv")!) {
+                        Label("GitHub: Beccaceci/opendisplay-tv", systemImage: "link")
                     }
                     // Permanent counterpart of the one-time row at the top.
                     Link(destination: AppStore.reviewURL) {

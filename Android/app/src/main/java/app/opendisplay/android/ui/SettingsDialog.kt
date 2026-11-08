@@ -178,9 +178,7 @@ class SettingsDialog : DialogFragment() {
 
             screen.category(R.string.section_about) {
                 addPreference(info(R.string.row_version, versionName()))
-                addPreference(link(R.string.link_website, "https://opendisplay.app", null))
-                addPreference(link(R.string.link_github, "https://github.com/peetzweg/opendisplay", null))
-                addPreference(link(R.string.link_kofi, "https://ko-fi.com/peetzweg", null))
+                addPreference(link(R.string.link_github, "https://github.com/Beccaceci/opendisplay-tv", null))
             }
         }
 
