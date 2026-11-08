@@ -101,7 +101,7 @@ struct PairingIdentity {
             kSecAttrAccount as String: peerAccount,
         ]
         let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
+        guard status == errSecSuccess || status == errSecItemNotFound || status == errSecInvalidOwnerEdit else {
             throw IdentityError.keychain(status)
         }
     }

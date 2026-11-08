@@ -28,6 +28,7 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import app.opendisplay.android.audio.AudioPlayer
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -96,6 +97,7 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
         }
     }
     private lateinit var wifiLock: android.net.wifi.WifiManager.WifiLock
+    private lateinit var audioPlayer: AudioPlayer
 
     // Read by network threads to build `hello`.
     @Volatile private var panel = Panel(0, 0, 1.0)
@@ -126,7 +128,9 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
         buildViews()
         setContentView(root)
         enterImmersive()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        audioPlayer = AudioPlayer().also { it.start() }
         decoder = VideoDecoder(this).also { it.start() }
         server = ReceiverServer(this, ::buildHello, ReceiverIdentity.loadOrCreate(this), this)
         advertiser = Advertiser(this)
@@ -290,6 +294,7 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
         if (wifiLock.isHeld) wifiLock.release()
         main.removeCallbacksAndMessages(null)
         decoder.release()
+        audioPlayer.release()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -614,6 +619,7 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
     override fun onSessionEnded() {
         hasPictureFlag = false
         decoder.reset()
+        audioPlayer.reset()
         main.post {
             connected = false
             hasPicture = false
@@ -632,6 +638,11 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
             main.post { refreshIdle() }
         }
         decoder.submit(unit)
+    }
+
+    override fun onAudioFrame(ptsMs: Long, aacData: ByteArray) {
+        if (blockingMessage != null) return
+        audioPlayer.submitAudio(ptsMs, aacData)
     }
 
     override fun onStreamConfig(codec: Codec?, codecToken: String, width: Int, height: Int, fps: Int) {

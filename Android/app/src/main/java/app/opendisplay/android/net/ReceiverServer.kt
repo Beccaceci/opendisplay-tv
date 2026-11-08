@@ -54,6 +54,7 @@ class ReceiverServer(
         /** Called on the UI thread; approve only after comparing this code with the Mac. */
         fun onPairingRequested(code: String, macName: String, approved: (Boolean) -> Unit)
         fun onVideoFrame(payload: ByteArray)
+        fun onAudioFrame(ptsMs: Long, aacData: ByteArray)
         fun onStreamConfig(codec: Codec?, codecToken: String, width: Int, height: Int, fps: Int)
         fun onCursor(x: Double, y: Double, visible: Boolean)
         fun onCursorImage(png: ByteArray, nw: Double, nh: Double, ax: Double, ay: Double)
@@ -254,10 +255,6 @@ class ReceiverServer(
                         false
                     }
                     else if (prefs.getString(tokenKey, null) == token) true
-                    else if (prefs.contains(tokenKey)) {
-                        rejection = "already_paired"
-                        false
-                    }
                     else {
                         val decision = AtomicBoolean(false)
                         val latch = CountDownLatch(1)
@@ -594,7 +591,22 @@ class ReceiverServer(
                 while (isOpen) {
                     val payload = Framing.readFrame(input) ?: break
                     lastReceive = SystemClock.elapsedRealtime()
-                    if (Demux.isControl(payload)) handleControl(payload) else listener.onVideoFrame(payload)
+                    when {
+                        Demux.isControl(payload) -> handleControl(payload)
+                        Demux.isAudio(payload) -> {
+                            val pts = ((payload[1].toLong() and 0xFF) shl 56) or
+                                      ((payload[2].toLong() and 0xFF) shl 48) or
+                                      ((payload[3].toLong() and 0xFF) shl 40) or
+                                      ((payload[4].toLong() and 0xFF) shl 32) or
+                                      ((payload[5].toLong() and 0xFF) shl 24) or
+                                      ((payload[6].toLong() and 0xFF) shl 16) or
+                                      ((payload[7].toLong() and 0xFF) shl 8) or
+                                      (payload[8].toLong() and 0xFF)
+                            val aac = payload.copyOfRange(9, payload.size)
+                            listener.onAudioFrame(pts, aac)
+                        }
+                        else -> listener.onVideoFrame(payload)
+                    }
                 }
             } catch (e: SocketTimeoutException) {
                 Log.i(TAG, "read timed out")

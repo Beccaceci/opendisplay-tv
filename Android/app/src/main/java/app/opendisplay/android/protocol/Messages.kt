@@ -58,6 +58,7 @@ object Messages {
         put("pv", WireProtocol.VERSION)
         put("displayMaxFrameRate", displayMaxFrameRate)
         put("videoCaps", JSONArray().apply { videoCaps.forEach { put(it.toJson()) } })
+        put("audioCaps", JSONArray().apply { put("aac") })
         // The legacy H.264 decode ceiling, for senders that predate videoCaps.
         videoCaps.firstOrNull { it.codec == Codec.H264 }?.let { h264 ->
             if (h264.maxWidth != null && h264.maxHeight != null) {

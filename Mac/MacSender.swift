@@ -79,6 +79,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var verifiedReceiverFingerprint: String?
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video")
+    private let audioQueue = DispatchQueue(label: "sender.audio", qos: .userInteractive)
+    private var audioEncoder: AudioEncoder?
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
     // The dial target. Written on `queue` only (after init): the controller
@@ -1271,6 +1273,31 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                       userInfo: [NSLocalizedDescriptionKey: "virtual display never appeared in SCShareableContent"])
     }
 
+    private func setupAudioEncoder() {
+        let enc = AudioEncoder()
+        var firstPacket = true
+        enc.onEncodedPacket = { [weak self] aacData, ptsMs in
+            guard let self, self.connectionReady, let conn = self.connection else { return }
+            var payload = Data(capacity: 9 + aacData.count)
+            payload.append(0x02) // Audio frame tag (Demux.AUDIO_FRAME_TAG)
+            var bigPts = ptsMs.bigEndian
+            withUnsafeBytes(of: &bigPts) { payload.append(contentsOf: $0) }
+            payload.append(aacData)
+
+            var length = UInt32(payload.count).bigEndian
+            var frame = Data(bytes: &length, count: 4)
+            frame.append(payload)
+
+            if firstPacket {
+                firstPacket = false
+                Log.info("first audio packet sent over TLS: \(aacData.count) bytes (pts: \(ptsMs)ms)")
+            }
+
+            conn.send(content: frame, completion: .contentProcessed { _ in })
+        }
+        self.audioEncoder = enc
+    }
+
     private func startCapture(display: SCDisplay,
                               sourcePixelsWide: Int, sourcePixelsHigh: Int,
                               receiver info: PhoneInfo) async throws {
@@ -1309,11 +1336,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let sourceDescription = "\(sourcePixelsWide)x\(sourcePixelsHigh)"
         Log.info("stream selected: \(selected.codec.uppercased()) \(pixelsWide)x\(pixelsHigh) @\(selected.framesPerSecond)fps from \(sourceDescription) quality=\(quality.rawValue)")
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let filter: SCContentFilter
+        if #available(macOS 14.0, *) {
+            filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        } else {
+            filter = SCContentFilter(display: display, excludingWindows: [])
+        }
 
         let config = SCStreamConfiguration()
         config.width = pixelsWide
         config.height = pixelsHigh
+        if #available(macOS 13.0, *), info.supportsAudio {
+            config.capturesAudio = true
+            config.excludesCurrentProcessAudio = true
+            config.sampleRate = 48000
+            config.channelCount = 2
+        }
         // Ask for 120 even though the virtual display is 60Hz: requesting
         // exactly 1/60 makes SCK's rate limiter skip frames that arrive a
         // hair early (beat frequency) — measured ~51fps instead of 60.
@@ -1359,6 +1397,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if #available(macOS 13.0, *), info.supportsAudio {
+            setupAudioEncoder()
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+            Log.info("audio capture enabled: ScreenCaptureKit system audio -> AAC-LC")
+        }
         self.stream = stream
         do {
             try await stream.startCapture()
@@ -1690,7 +1733,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connect() {
         guard !stopped else { return }
         switch transport {
-        case .tcp(let endpoint): connectTCP(endpoint)
+        case .tcp(let endpoint):
+            if case .hostPort(let host, _) = endpoint {
+                TVAutoWake.wakeAndLaunch(host: "\(host)")
+            }
+            connectTCP(endpoint)
         case .usb(let udid, let port):
             connectWired { (try await Usbmux.dial(udid: udid, port: port, queue: self.queue), nil) }
         case .accessory(let serial):
@@ -2979,8 +3026,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
-        guard stream === self.stream,
-              type == .screen,
+        guard stream === self.stream else { return }
+        if type == .audio {
+            guard CMSampleBufferIsValid(sampleBuffer) else { return }
+            audioEncoder?.encode(sampleBuffer: sampleBuffer)
+            return
+        }
+        guard type == .screen,
               CMSampleBufferIsValid(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
@@ -3551,6 +3603,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         activeStreamConfiguration = nil
         frameRateLimiter = FrameRateLimiter(framesPerSecond: 60)
         pipelineLock.unlock()
+        audioEncoder?.reset()
         captureDisplayID = 0
         queue.async { self.captureSourceCheck = CaptureSourceCheck() }
         if discardingLastFrame {

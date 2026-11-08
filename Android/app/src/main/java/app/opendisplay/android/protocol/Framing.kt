@@ -61,11 +61,16 @@ object Framing {
  */
 object Demux {
     private const val MAX_CONTROL = 32768
+    const val AUDIO_FRAME_TAG: Byte = 0x02
 
     fun isControl(payload: ByteArray): Boolean {
         if (payload.isEmpty() || payload.size >= MAX_CONTROL) return false
         if (payload[0] != '{'.code.toByte()) return false
         for (b in payload) if (b.toInt() == 0) return false
         return true
+    }
+
+    fun isAudio(payload: ByteArray): Boolean {
+        return payload.size >= 10 && payload[0] == AUDIO_FRAME_TAG
     }
 }

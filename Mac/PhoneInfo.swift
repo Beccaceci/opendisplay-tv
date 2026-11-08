@@ -19,6 +19,7 @@ struct PhoneInfo: Decodable {
     let maxEncodeHigh: Int?  //  6.5): caps the stream, and with it the desktop
     let displayMaxFrameRate: Int?       // presentation ceiling; absent = legacy 60
     let videoCaps: [VideoCapability]?   // codec-specific joint decode constraints
+    let audioCaps: [String]?           // audio codecs the receiver supports ("aac", etc.)
     let power: [String]?  // power actions the receiver accepts on THIS session
                           // (PROTOCOL.md 6.6); absent = none offered
     let panel: PanelInfo? // the receiver's panel facts (PROTOCOL.md 6.7);
@@ -26,6 +27,7 @@ struct PhoneInfo: Decodable {
 
     var kind: String { device ?? "device" }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }
+    var supportsAudio: Bool { audioCaps?.contains("aac") == true }
 
     /// What the sender knows about the receiver's panel, in its current
     /// orientation: `panel` when it is valid, else the legacy reading of
