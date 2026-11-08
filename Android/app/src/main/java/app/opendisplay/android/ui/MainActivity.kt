@@ -35,6 +35,7 @@ import app.opendisplay.android.R
 import app.opendisplay.android.net.AccessoryLink
 import app.opendisplay.android.net.Advertiser
 import app.opendisplay.android.net.ReceiverServer
+import app.opendisplay.android.net.ReceiverIdentity
 import app.opendisplay.android.protocol.AnnexB
 import app.opendisplay.android.protocol.Codec
 import app.opendisplay.android.protocol.Messages
@@ -127,7 +128,7 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
         enterImmersive()
 
         decoder = VideoDecoder(this).also { it.start() }
-        server = ReceiverServer(this, ::buildHello)
+        server = ReceiverServer(this, ::buildHello, ReceiverIdentity.loadOrCreate(this), this)
         advertiser = Advertiser(this)
         val slop = 10 * resources.displayMetrics.density
         gestures = TouchGestures(
@@ -232,6 +233,7 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
             if (hasPicture) "$info, %.0f fps".format(java.util.Locale.US, stats.lastSummary.fps) else info
         }
     override val uiKind: String get() = uiKind()
+    override val pairedMacFingerprint: String? get() = ReceiverServer.pairedMacFingerprint(this)
 
     override fun onNameChanged(name: String?) {
         DeviceIdentity.setServiceName(this, name)
@@ -239,6 +241,19 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
     }
 
     override fun onOverlayChanged(enabled: Boolean) = refreshIdle()
+
+    override fun forgetPairedMac() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Forget paired Mac?")
+            .setMessage("This disconnects the Mac and removes its saved access. To connect again, pair from both devices.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Forget Mac") { _, _ ->
+                ReceiverServer.forgetPairedMacs(this)
+                server.disconnectCurrent()
+                refreshIdle()
+            }
+            .show()
+    }
 
     override fun onStart() {
         super.onStart()
@@ -559,6 +574,22 @@ class MainActivity : AppCompatActivity(), ReceiverServer.Listener, VideoDecoder.
     // endregion
 
     // region ReceiverServer.Listener (network threads)
+
+    override fun onPairingRequested(code: String, macName: String, approved: (Boolean) -> Unit) {
+        main.post {
+            if (isFinishing || isDestroyed) {
+                approved(false)
+                return@post
+            }
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Pair $macName?")
+                .setMessage("Compare this code with the Mac before allowing it:\n\n$code")
+                .setCancelable(false)
+                .setNegativeButton("Cancel") { _, _ -> approved(false) }
+                .setPositiveButton("Allow Mac") { _, _ -> approved(true) }
+                .show()
+        }
+    }
 
     override fun onSessionStarted(transport: String) {
         this.transport = transport

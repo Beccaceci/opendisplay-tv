@@ -31,8 +31,10 @@ class SettingsDialog : DialogFragment() {
         val isConnected: Boolean
         val streamSummary: String?
         val uiKind: String
+        val pairedMacFingerprint: String?
         fun onNameChanged(name: String?)
         fun onOverlayChanged(enabled: Boolean)
+        fun forgetPairedMac()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -97,6 +99,20 @@ class SettingsDialog : DialogFragment() {
                 addPreference(info(R.string.row_listening, getString(R.string.row_listening_value)))
                 connection = info(R.string.row_connection, null).also { addPreference(it) }
                 stream = info(R.string.row_stream, null).also { addPreference(it) }
+            }
+
+            screen.category(null) {
+                addPreference(Preference(ctx).apply {
+                    title = "Forget paired Mac"
+                    summary = host.pairedMacFingerprint?.let { "Paired identity: $it" }
+                        ?: "No Mac is paired"
+                    isSelectable = host.pairedMacFingerprint != null
+                    isIconSpaceReserved = false
+                    setOnPreferenceClickListener {
+                        host.forgetPairedMac()
+                        true
+                    }
+                })
             }
 
             screen.category(R.string.section_name) {

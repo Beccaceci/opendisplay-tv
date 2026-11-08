@@ -25,7 +25,7 @@
 
     <string name="section_status">Status</string>
     <string name="row_listening">Listening</string>
-    <string name="row_listening_value">Port 9000</string>
+    <string name="row_listening_value">Secure connection</string>
     <string name="row_connection">Connection</string>
     <string name="row_connected">Connected</string>
     <string name="row_waiting">Waiting for a computer</string>

@@ -1,7 +1,8 @@
-# OpenDisplay receiver for Android
+# OpenDisplay receiver for Android and Android TV
 
-Turns an Android phone or tablet into an extra display for the OpenDisplay
-Mac sender. It speaks the same wire protocol as the iPhone/iPad receiver
+Turns an Android phone, tablet, or Android TV into an extra display for the
+OpenDisplay Mac sender. Android TV support is being adapted and needs validation
+on real televisions. It speaks the same wire protocol as the iPhone/iPad receiver
 ([PROTOCOL.md](../PROTOCOL.md), pv 3), so the Mac app needs no changes.
 
 Supports Android 5.0 (API 21) and later, so old tablets can be second screens
@@ -10,16 +11,17 @@ immersive insets) are used when present.
 
 ## What works
 
-- Discovery over Wi-Fi: advertises `_opensidecar._tcp` with the TXT `id`/`pv`
-  keys, so the device shows up in the Mac app's list.
+- Discovery over Wi-Fi: advertises the fork-only `_opendisplay._tcp` service
+  with secure-protocol version TXT; the Mac sender and receiver use TLS and
+  require a matching, user-approved pairing code before streaming.
 - Video: H.264 always, HEVC when the device has a hardware HEVC decoder.
   MediaCodec decodes straight to a SurfaceView. Stream changes (rotation,
   quality) rebuild the decoder from the new parameter sets, and lost decode
   state asks the sender for a keyframe.
 - The panel (`hello.panel`) is the window in its current orientation at the
   real density, so rotating the device re-shapes the Mac's virtual display.
-- Cursor: the Mac pointer is drawn over the video from `cursor`/`cursorImg`,
-  over TCP or the UDP side channel (port 9001) on Wi-Fi.
+- Cursor: the Mac pointer is drawn over the video from `cursor`/`cursorImg`
+  within the TCP stream; the fork does not use the upstream UDP cursor port.
 - Input: tap to click, hold or drag to drag, two-finger pan to scroll, using
   the same rules as the iOS receiver (a press waits 120 ms or 10 dp of
   movement before it becomes a mouse-down, so a scroll never clicks).
@@ -57,6 +59,11 @@ Dev") next to a release build.
 
 ## Connecting
 
+**Android TV:** the app appears in the TV app launcher and can be opened with
+the remote. Leave it open while using the display. The Mac discovers it over
+the local network; select it once on first use. The Mac sender remembers a
+connected Wi-Fi receiver and can reconnect to it when it reappears.
+
 **Wi-Fi:** open the app on the Android device and pick it in the Mac app.
 Both need to be on the same network.
 
@@ -64,7 +71,7 @@ Both need to be on the same network.
 and point the sender at it by hand:
 
 ```sh
-adb forward tcp:9100 tcp:9000
+adb forward tcp:9100 tcp:9443
 open "OpenDisplay.app" --args -host 127.0.0.1 -port 9100
 ```
 

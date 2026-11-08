@@ -72,17 +72,30 @@ class IdleView(context: Context, kind: String, onSettings: () -> Unit) : ScrollV
         column.addView(card, LinearLayout.LayoutParams(minOf(dp(420), screenWidth() - dp(32)), WRAP))
 
         column.addView(View(context), LinearLayout.LayoutParams(1, 0, 1f))
-        column.addView(MaterialButton(ContextThemeWrapper(context,
+        val settingsButton = MaterialButton(ContextThemeWrapper(context,
             com.google.android.material.R.style.Widget_Material3_Button_TonalButton)).apply {
             text = context.getString(R.string.settings_and_help)
+            isFocusable = true
+            isFocusableInTouchMode = true
+            setStrokeColor(ColorStateList.valueOf(color(com.google.android.material.R.attr.colorPrimary)))
+            strokeWidth = 0
+            setOnFocusChangeListener { _, hasFocus ->
+                // TV remotes have no hover state; a strong outline makes the
+                // focused action clear while navigating with the D-pad.
+                strokeWidth = if (hasFocus) dp(3) else 0
+            }
             setOnClickListener { onSettings() }
-        }, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(24) })
-        column.addView(TextView(context).apply {
-            text = context.getString(R.string.shake_tip, kind)
-            androidx.core.widget.TextViewCompat.setTextAppearance(this, attrRes(com.google.android.material.R.attr.textAppearanceBodySmall))
-            setTextColor(color(com.google.android.material.R.attr.colorOutline))
-            gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(8); bottomMargin = dp(8) })
+        }
+        column.addView(settingsButton,
+            LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(24) })
+        if (kind != "TV") {
+            column.addView(TextView(context).apply {
+                text = context.getString(R.string.shake_tip, kind)
+                androidx.core.widget.TextViewCompat.setTextAppearance(this, attrRes(com.google.android.material.R.attr.textAppearanceBodySmall))
+                setTextColor(color(com.google.android.material.R.attr.colorOutline))
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(8); bottomMargin = dp(8) })
+        }
     }
 
     fun setStatus(text: String, connected: Boolean) {

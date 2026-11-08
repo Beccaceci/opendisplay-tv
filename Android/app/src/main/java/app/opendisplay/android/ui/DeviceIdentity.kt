@@ -41,8 +41,11 @@ object DeviceIdentity {
     }
 
     /** Free-form device kind for the sender's UI text. */
-    fun deviceKind(context: Context): String =
-        if (context.resources.configuration.smallestScreenWidthDp >= 600) "Android tablet" else "Android phone"
+    fun deviceKind(context: Context): String = when {
+        context.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_LEANBACK) -> "Android TV"
+        context.resources.configuration.smallestScreenWidthDp >= 600 -> "Android tablet"
+        else -> "Android phone"
+    }
 
     fun ipv4Addresses(): List<String> = try {
         NetworkInterface.getNetworkInterfaces().toList()

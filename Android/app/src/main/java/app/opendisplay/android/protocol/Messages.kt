@@ -9,8 +9,9 @@ object WireProtocol {
     const val PENCIL_WIRE_VERSION = 3
     const val MIN_SUPPORTED_PEER = 1
     const val ASSUMED_WHEN_ABSENT = 1
-    const val TCP_PORT = 9000
-    const val SERVICE_TYPE = "_opensidecar._tcp"
+    const val TCP_PORT = 9443
+    const val SERVICE_TYPE = "_opendisplay._tcp"
+    const val SECURE_PROTOCOL_VERSION = 1
 }
 
 /** Panel facts in the current orientation (PROTOCOL.md 6.7). */

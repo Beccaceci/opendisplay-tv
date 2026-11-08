@@ -2,6 +2,7 @@ import SwiftUI
 import Network
 import Combine
 import Sparkle
+import ServiceManagement
 
 /// How the app presents itself. One bundle, switched at runtime via the
 /// activation policy — like Raycast/Hammerspoon style background agents.
@@ -220,12 +221,13 @@ final class SenderController: ObservableObject {
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
-    @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
+    @Published var port = UserDefaults.standard.string(forKey: "securePort") ?? "\(WireProtocol.secureWiFiPort)"
     // `-mode mirror` / `-mode extend` launch argument also works.
     @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
     }
+    @Published private(set) var pairedReceiverFingerprint = try? PairingIdentity.trustedPeer()?.fingerprint
 
     var running: Bool { !sessions.isEmpty }
 
@@ -252,8 +254,9 @@ final class SenderController: ObservableObject {
     //    the virtual display survives, so no screen flash, no window
     //    reshuffle — the earlier no-switching policy existed because
     //    migration used to mean destroying and recreating the session.
-    //  - WiFi devices the user connected before (wifiRemembered) reconnect
-    //    in a short window at LAUNCH only — never mid-session.
+    //  - Wi-Fi receivers explicitly connected before are remembered and
+    //    reconnect whenever discovery sees them, including after app open,
+    //    wake, or Wi-Fi recovery. Disconnect removes that remembered target.
     // `-autostart NO` disables all auto-connecting, including migrations.
     private var usbDisabled = Set(UserDefaults.standard.stringArray(forKey: "usbDisabled") ?? []) {
         didSet { UserDefaults.standard.set(Array(usbDisabled), forKey: "usbDisabled") }
@@ -272,13 +275,6 @@ final class SenderController: ObservableObject {
     private let autoConnectEnabled = UserDefaults.standard.object(forKey: "autostart") == nil
         || UserDefaults.standard.bool(forKey: "autostart")
 
-    // Bonjour usually reports devices before usbmuxd does — WiFi reconnects
-    // wait out this window so a cabled device is dialed over USB first. The
-    // deadline closes the window for good: a remembered WiFi device that
-    // appears later was brought near the Mac mid-session, which is a user
-    // action to confirm, not auto-grab.
-    private var wifiAutoConnectArmed = false
-    private let wifiAutoConnectDeadline = Date().addingTimeInterval(12)
     // Services whose Bonjour record is currently seen over the direct
     // host-to-host cable. Plugging that cable in is a deliberate act, so a
     // record newly gaining such an interface connects like a cabled iPhone
@@ -311,16 +307,11 @@ final class SenderController: ObservableObject {
             self?.accessoryDevices = devices
             self?.wiredDevicesChanged()
         }
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(2))
-            self.wifiAutoConnectArmed = true
-            self.autoConnect()
-        }
     }
 
     private func startBrowsing() {
         // TXT records carry the receiver's install id (new receivers).
-        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil), using: .tcp)
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opendisplay._tcp", domain: nil), using: .tcp)
         browser.stateUpdateHandler = { [weak self, weak browser] state in
             DispatchQueue.main.async {
                 guard let self, let browser, self.browser === browser else { return }
@@ -378,7 +369,13 @@ final class SenderController: ObservableObject {
     }
 
     private static func isPolicyDenied(_ error: NWError) -> Bool {
-        if case .dns(let code) = error { return code == DNSServiceErrorType(kDNSServiceErr_PolicyDenied) }
+        if case .dns(let code) = error {
+            // macOS 26 reports local-network privacy denial as NoAuth
+            // (-65555) for this Bonjour browse, while earlier releases use
+            // PolicyDenied (-65570).
+            return code == DNSServiceErrorType(kDNSServiceErr_PolicyDenied)
+                || Int32(code) == -65555
+        }
         return false
     }
 
@@ -471,7 +468,6 @@ final class SenderController: ObservableObject {
                 connect(to: .usb(udid: device.udid))
             }
         }
-        guard wifiAutoConnectArmed, Date() < wifiAutoConnectDeadline else { return }
         for result in discovered {
             let target = ConnectionTarget.wifi(result)
             if wifiRemembered.contains(target.sessionID),
@@ -731,7 +727,15 @@ final class SenderController: ObservableObject {
                 transport = wiredTransport(udid: udid, port: portNum)
             }
         case .wifi(let result):
-            transport = .tcp(result.endpoint)
+            if UserDefaults.standard.object(forKey: "host") != nil,
+               let portNum = UInt16(port) {
+                // Diagnostic/manual endpoint override; normal operation stays
+                // on Bonjour, while this can verify a receiver's IPv4 route.
+                transport = .tcp(.hostPort(host: NWEndpoint.Host(host),
+                                           port: NWEndpoint.Port(rawValue: portNum)!))
+            } else {
+                transport = .tcp(result.endpoint)
+            }
         }
 
         let name = label(for: target)
@@ -750,8 +754,22 @@ final class SenderController: ObservableObject {
             session.status = text
             Log.info("status[\(id)]: \(text)")
         }
+        sender.onPairingPrompt = { code, receiverFingerprint in
+            let alert = NSAlert()
+            alert.messageText = "Pair with \(name)?"
+            alert.informativeText = "Compare the pairing code on both screens. After you continue, the TV will ask you to confirm the same code.\n\nPairing code: \(code)\n\nTV certificate: \(receiverFingerprint)"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Continue Pairing")
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn
+        }
+        sender.onPairingDeclined = { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.disconnect(session)
+        }
         sender.onHello = { [weak self, weak session] info in
             guard let self, let session else { return }
+            self.pairedReceiverFingerprint = try? PairingIdentity.trustedPeer()?.fingerprint
             session.deviceID = info.id
             session.deviceKind = info.device
             session.helloArrived(info)
@@ -860,6 +878,17 @@ final class SenderController: ObservableObject {
 
     func disconnectAll() {
         sessions.forEach { disconnect($0) }
+    }
+
+    func forgetTVPairing() {
+        disconnectAll()
+        wifiRemembered.removeAll()
+        do {
+            try PairingIdentity.forgetTrustedPeer()
+            pairedReceiverFingerprint = nil
+        } catch {
+            Log.info("could not forget paired TV: \(error)")
+        }
     }
 
     /// Restart a session that failed to start (its pipeline is already
@@ -985,7 +1014,6 @@ final class SenderController: ObservableObject {
 @MainActor
 final class PermissionMonitor: ObservableObject {
     @Published var screenRecording = false
-    @Published var accessibility = false
     private var timer: Timer?
 
     init() {
@@ -997,7 +1025,6 @@ final class PermissionMonitor: ObservableObject {
 
     func refresh() {
         screenRecording = CGPreflightScreenCaptureAccess()
-        accessibility = AXIsProcessTrusted()
     }
 
     /// Fire the system permission dialog on demand. macOS only shows each
@@ -1008,11 +1035,6 @@ final class PermissionMonitor: ObservableObject {
         refresh()
     }
 
-    func requestAccessibility() {
-        _ = InputInjector.ensureAccessibilityPermission()
-        refresh()
-    }
-
     static func openPrivacyPane(_ anchor: String) {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
             NSWorkspace.shared.open(url)
@@ -1020,9 +1042,39 @@ final class PermissionMonitor: ObservableObject {
     }
 }
 
+@MainActor
+final class LoginItemMonitor: ObservableObject {
+    @Published private(set) var enabled = SMAppService.mainApp.status == .enabled
+    @Published private(set) var message: String?
+
+    func setEnabled(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            refresh()
+        } catch {
+            refresh()
+            message = error.localizedDescription
+        }
+    }
+
+    private func refresh() {
+        enabled = SMAppService.mainApp.status == .enabled
+        if SMAppService.mainApp.status == .requiresApproval {
+            message = "Allow OpenDisplay in System Settings → General → Login Items."
+        } else {
+            message = nil
+        }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var controller: SenderController
     @StateObject private var permissions = PermissionMonitor()
+    @StateObject private var loginItem = LoginItemMonitor()
     // Optional so the view still compiles/previews without an updater (e.g.
     // if Sparkle ever fails to start); the button just disables itself then.
     let updater: SPUStandardUpdaterController?
@@ -1055,7 +1107,7 @@ struct ContentView: View {
             Form {
                 Section("Devices") {
                     if controller.deviceEntries.isEmpty {
-                        Text("No devices found — plug one in via USB, or open the OpenDisplay app on a device on this WiFi network.")
+                        Text("Open OpenDisplay Dev on your TV and keep it on the same Wi-Fi network. When it appears here, choose Connect.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1086,6 +1138,19 @@ struct ContentView: View {
                                 }
                             }
                         }
+                    }
+                }
+
+                Section("Paired TV") {
+                    if let fingerprint = controller.pairedReceiverFingerprint {
+                        Text("Trusted TV certificate: \(fingerprint)")
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                        Button("Forget TV") { controller.forgetTVPairing() }
+                    } else {
+                        Text("No TV is paired yet")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -1131,6 +1196,21 @@ struct ContentView: View {
                 }
                 .help("Opens System Settings → Displays, where you can position the extended displays relative to your Mac screen (Arrange…). Each device shows up as its own display, named after the device.")
 
+                Section("Startup") {
+                    Toggle("Open OpenDisplay at login", isOn: Binding(
+                        get: { loginItem.enabled },
+                        set: { loginItem.setEnabled($0) }
+                    ))
+                    if let message = loginItem.message {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("When enabled, the Mac reconnects to the remembered TV while its receiver is open.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Permissions") {
                     permissionRow(
                         "Screen Recording",
@@ -1138,13 +1218,6 @@ struct ContentView: View {
                         help: "Required to capture the display.",
                         anchor: "Privacy_ScreenCapture",
                         request: { permissions.requestScreenRecording() }
-                    )
-                    permissionRow(
-                        "Accessibility",
-                        granted: permissions.accessibility,
-                        help: "Required for touch input from the device.",
-                        anchor: "Privacy_Accessibility",
-                        request: { permissions.requestAccessibility() }
                     )
                     // macOS offers no API to query Local Network access, so
                     // infer from discovery: a blocked browse is a definite no,
@@ -1155,7 +1228,7 @@ struct ContentView: View {
                         uncertain: controller.discovered.isEmpty && !controller.localNetworkDenied,
                         help: controller.localNetworkDenied
                             ? "Off for OpenDisplay on this Mac, so WiFi mode finds no devices. Allow OpenDisplay under Privacy & Security → Local Network."
-                            : "Required for WiFi mode. If no device appears in the Devices list, allow OpenDisplay under Privacy & Security → Local Network on this Mac AND on the device — and keep the OpenDisplay app open there.",
+                            : "Required for Wi-Fi. If the TV does not appear, allow OpenDisplay under Privacy & Security → Local Network on this Mac and keep the receiver open on the TV.",
                         anchor: "Privacy_LocalNetwork"
                     )
                 }

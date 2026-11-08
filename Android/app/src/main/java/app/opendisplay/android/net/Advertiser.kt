@@ -7,8 +7,8 @@ import app.opendisplay.android.Log
 import app.opendisplay.android.protocol.WireProtocol
 
 /**
- * Bonjour advertisement (PROTOCOL.md 2.1): `_opensidecar._tcp` with TXT `id`
- * (must equal hello.id) and `pv`. The name is display-only.
+ * Bonjour advertisement for the secured fork-only service. Peer certificates
+ * and the authorization token establish identity; the TXT name is display-only.
  */
 class Advertiser(context: Context) {
     private val nsd = context.getSystemService(Context.NSD_SERVICE) as NsdManager
@@ -33,6 +33,7 @@ class Advertiser(context: Context) {
             setPort(port)
             setAttribute("id", installId)
             setAttribute("pv", WireProtocol.VERSION.toString())
+            setAttribute("spv", WireProtocol.SECURE_PROTOCOL_VERSION.toString())
         }
         val listener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(info: NsdServiceInfo) {

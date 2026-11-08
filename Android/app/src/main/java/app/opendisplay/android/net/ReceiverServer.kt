@@ -15,6 +15,7 @@ import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
@@ -27,10 +28,15 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.SSLServerSocket
+import javax.net.ssl.SSLSocket
 
 /**
- * The receiver end of PROTOCOL.md: listens on TCP 9000 (and takes the USB
- * accessory, see [adoptAccessory]), serves one sender at a time, speaks
+ * Secured Wi-Fi receiver: listens on the fork-only TLS TCP port, serves one
+ * authenticated sender at a time, speaks
  * hello/ping/kf/input, and hands video and the sender's control
  * messages to [listener]. Callbacks arrive on network threads.
  */
@@ -38,11 +44,15 @@ class ReceiverServer(
     private val listener: Listener,
     /** Builds the current `hello`; called on network threads. */
     private val helloFactory: (cursorPort: Int?) -> JSONObject,
+    private val identity: ReceiverIdentity.Identity,
+    private val context: android.content.Context,
     private val port: Int = WireProtocol.TCP_PORT,
 ) {
     interface Listener {
         fun onSessionStarted(transport: String)
         fun onSessionEnded()
+        /** Called on the UI thread; approve only after comparing this code with the Mac. */
+        fun onPairingRequested(code: String, macName: String, approved: (Boolean) -> Unit)
         fun onVideoFrame(payload: ByteArray)
         fun onStreamConfig(codec: Codec?, codecToken: String, width: Int, height: Int, fps: Int)
         fun onCursor(x: Double, y: Double, visible: Boolean)
@@ -65,8 +75,11 @@ class ReceiverServer(
     @Volatile private var current: Session? = null
     private var generation = 0
     private val candidates = mutableListOf<Socket>()
+    private val authenticating = mutableSetOf<Socket>()
     private var timers: ScheduledExecutorService? = null
     private var cursorChannel: CursorChannel? = null
+    private val pendingAuthentications = AtomicInteger(0)
+    private val nextAuthAttempt = AtomicInteger(0)
 
     @Volatile var senderPv: Int = WireProtocol.ASSUMED_WHEN_ABSENT
         private set
@@ -79,7 +92,8 @@ class ReceiverServer(
             running = true
             ++generation
         }
-        cursorChannel = CursorChannel(port + 1, ::onCursorDatagram, ::ackCursorFlow).also { it.start() }
+        // The fork uses the single encrypted TCP stream for cursor updates;
+        // never open the upstream unauthenticated UDP cursor port.
         timers = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "od-timers").apply { isDaemon = true }
         }.also { t ->
@@ -100,6 +114,8 @@ class ReceiverServer(
             current = null
             candidates.forEach { closeQuietly(it) }
             candidates.clear()
+            authenticating.forEach { closeQuietly(it) }
+            authenticating.clear()
             closeQuietly(serverSocket)
             serverSocket = null
         }
@@ -116,6 +132,16 @@ class ReceiverServer(
     val isOnAccessory: Boolean
         get() = synchronized(lock) { current?.takeIf { it.isOpen }?.link is AccessoryLink }
 
+    fun disconnectCurrent() {
+        val session = synchronized(lock) {
+            current.also { current = null }
+        }
+        if (session != null) {
+            session.close()
+            listener.onSessionEnded()
+        }
+    }
+
     // region Accept and adopt
 
     private fun live(gen: Int) = running && gen == generation
@@ -123,8 +149,10 @@ class ReceiverServer(
     private fun acceptLoop(gen: Int) {
         while (live(gen)) {
             val server = try {
-                ServerSocket().apply {
+                (identity.serverSocketFactory.createServerSocket() as SSLServerSocket).apply {
                     reuseAddress = true
+                    needClientAuth = false
+                    enabledProtocols = supportedProtocols.filter { it == "TLSv1.3" || it == "TLSv1.2" }.toTypedArray()
                     bind(InetSocketAddress(this@ReceiverServer.port))
                 }
             } catch (e: IOException) {
@@ -142,16 +170,127 @@ class ReceiverServer(
             Log.i(TAG, "listening on TCP $port")
             try {
                 while (live(gen)) {
-                    val socket = server.accept()
+                    val socket = server.accept() as SSLSocket
+                    socket.useClientMode = false
                     socket.tcpNoDelay = true // tiny input packets must not wait for ACKs
                     socket.keepAlive = true
-                    onAccepted(socket)
+                    if (pendingAuthentications.incrementAndGet() > MAX_PENDING_AUTH) {
+                        pendingAuthentications.decrementAndGet()
+                        closeQuietly(socket)
+                        continue
+                    }
+                    val attempt = nextAuthAttempt.incrementAndGet()
+                    synchronized(lock) { authenticating.add(socket) }
+                    Log.i(TAG, "auth[$attempt] accepted")
+                    Thread({
+                        try {
+                            if (live(gen) && authorize(socket, attempt)) onAccepted(socket)
+                            else closeQuietly(socket)
+                        } finally {
+                            synchronized(lock) { authenticating.remove(socket) }
+                            pendingAuthentications.decrementAndGet()
+                        }
+                    }, "od-auth").apply { isDaemon = true }.start()
                 }
             } catch (e: IOException) {
                 if (live(gen)) Log.w(TAG, "accept failed: $e; relistening")
             } finally {
                 closeQuietly(server)
             }
+        }
+    }
+
+    /** TLS encrypts the stream; the remembered token authorizes the Mac before a session exists. */
+    private fun authorize(socket: SSLSocket, attempt: Int): Boolean {
+        val started = SystemClock.elapsedRealtime()
+        var phase = "tls"
+        try {
+            socket.soTimeout = TLS_TIMEOUT_MS
+            Log.i(TAG, "auth[$attempt] TLS handshake started")
+            socket.startHandshake()
+            Log.i(TAG, "auth[$attempt] TLS ready after ${SystemClock.elapsedRealtime() - started}ms " +
+                "protocol=${socket.session.protocol} cipher=${socket.session.cipherSuite}")
+            // The Mac displays a confirmation dialog before sending secureAuth.
+            // Keep that human interval separate from the TLS handshake timeout.
+            phase = "waiting_for_mac_confirmation"
+            socket.soTimeout = MAC_CONFIRMATION_TIMEOUT_MS
+            val deadline = timers?.schedule({
+                Log.i(TAG, "auth[$attempt] Mac confirmation deadline expired")
+                closeQuietly(socket)
+            }, MAC_CONFIRMATION_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
+                ?: throw IOException("receiver authorization timer unavailable")
+            val request = try {
+                val input = DataInputStream(socket.inputStream)
+                Framing.readFrame(input)?.let { JSONObject(String(it, Charsets.UTF_8)) }
+                    ?: return false
+            } finally {
+                deadline.cancel(false)
+            }
+            phase = "secure_auth"
+            Log.i(TAG, "auth[$attempt] secureAuth received after ${SystemClock.elapsedRealtime() - started}ms")
+            if (request.optString("type") != "secureAuth") return false
+            if (request.optInt("secureVersion", -1) != WireProtocol.SECURE_PROTOCOL_VERSION) {
+                sendSecureReady(socket, false, "version_mismatch")
+                return false
+            }
+            val mode = request.optString("mode")
+            val macFingerprint = request.optString("macFingerprint").uppercase()
+            val macName = request.optString("macName").ifBlank { "Mac" }
+            val token = request.optString("token").uppercase()
+            if (!FINGERPRINT.matches(macFingerprint) || !TOKEN.matches(token)) return false
+
+            val prefs = context.getSharedPreferences(PAIRING_PREFS, android.content.Context.MODE_PRIVATE)
+            val tokenKey = "token:$macFingerprint"
+            var rejection = "pairing_rejected"
+            val approved = when (mode) {
+                "resume" -> (prefs.getString(tokenKey, null) == token).also {
+                    if (!it) rejection = "pairing_missing"
+                }
+                "pair" -> {
+                    val suppliedCode = request.optString("comparisonCode")
+                    val expectedCode = ReceiverIdentity.comparisonCode(identity.fingerprint, macFingerprint)
+                    if (!expectedCode.equals(suppliedCode, ignoreCase = true)) {
+                        rejection = "comparison_mismatch"
+                        false
+                    }
+                    else if (prefs.getString(tokenKey, null) == token) true
+                    else if (prefs.contains(tokenKey)) {
+                        rejection = "already_paired"
+                        false
+                    }
+                    else {
+                        val decision = AtomicBoolean(false)
+                        val latch = CountDownLatch(1)
+                        listener.onPairingRequested(expectedCode, macName) { allow ->
+                            decision.set(allow)
+                            latch.countDown()
+                        }
+                        phase = "waiting_for_tv_confirmation"
+                        latch.await(PAIRING_TIMEOUT_SECONDS, TimeUnit.SECONDS) && decision.get().also { allow ->
+                            if (allow) prefs.edit().putString(tokenKey, token).apply()
+                            else rejection = "pairing_declined"
+                        }
+                    }
+                }
+                else -> false
+            }
+            socket.soTimeout = 0
+            sendSecureReady(socket, approved, if (approved) null else rejection)
+            if (approved) Log.i(TAG, "auth[$attempt] authenticated paired Mac $macFingerprint")
+            return approved
+        } catch (e: Exception) {
+            Log.i(TAG, "auth[$attempt] failed phase=$phase after ${SystemClock.elapsedRealtime() - started}ms: " +
+                android.util.Log.getStackTraceString(e))
+            return false
+        }
+    }
+
+    private fun sendSecureReady(socket: Socket, approved: Boolean, reason: String?) {
+        val response = JSONObject().put("type", "secureReady").put("ok", approved)
+        reason?.let { response.put("reason", it) }
+        DataOutputStream(socket.outputStream).apply {
+            write(Framing.encode(response.toString().toByteArray(Charsets.UTF_8)))
+            flush()
         }
     }
 
@@ -202,8 +341,9 @@ class ReceiverServer(
      * while stopped, so the caller keeps the accessory for later.
      */
     internal fun adoptAccessory(link: Link): Boolean {
-        Log.i(TAG, "connection from ${link.remote}")
-        return adopt(link, null)
+        Log.w(TAG, "refusing unencrypted USB accessory path ${link.remote}; use authenticated Wi-Fi")
+        closeQuietly(link)
+        return false
     }
 
     private fun adopt(link: Link, initial: ByteArray?): Boolean {
@@ -478,7 +618,24 @@ class ReceiverServer(
 
     companion object {
         private const val TAG = "OpenDisplay"
+        private const val PAIRING_PREFS = "trusted-macs"
+        private const val PAIRING_TIMEOUT_SECONDS = 90L
+        private const val TLS_TIMEOUT_MS = 10_000
+        private const val MAC_CONFIRMATION_TIMEOUT_MS = 90_000
+        private const val MAX_PENDING_AUTH = 2
+        private val FINGERPRINT = Regex("[0-9A-F]{64}")
+        private val TOKEN = Regex("[0-9A-F]{64}")
         private val POISON = ByteArray(0)
+
+        fun pairedMacFingerprint(context: android.content.Context): String? =
+            context.getSharedPreferences(PAIRING_PREFS, android.content.Context.MODE_PRIVATE)
+                .all.keys.firstOrNull { it.startsWith("token:") }
+                ?.removePrefix("token:")
+
+        fun forgetPairedMacs(context: android.content.Context) {
+            val prefs = context.getSharedPreferences(PAIRING_PREFS, android.content.Context.MODE_PRIVATE)
+            prefs.edit().clear().apply()
+        }
 
         internal fun closeQuietly(c: java.io.Closeable?) {
             try {

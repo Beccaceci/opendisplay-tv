@@ -37,6 +37,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // Status surfaced to the UI (updated on main thread).
     @MainActor var onStatus: ((String) -> Void)?
+    /// Pairing requires the user to compare the code with the one displayed on the receiver.
+    @MainActor var onPairingPrompt: ((String, String) -> Bool)?
+    @MainActor var onPairingDeclined: (() -> Void)?
     @MainActor var onStats: ((Int, Double) -> Void)?   // framesSent, mbps
     // Fired when a previously connected device stays gone past the grace
     // period — the controller ends the session (capture, virtual display,
@@ -73,6 +76,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
+    private var verifiedReceiverFingerprint: String?
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video")
     private let startCode: [UInt8] = [0, 0, 0, 1]
@@ -441,18 +445,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 await reconfigure(latest)
             }
 
-            // Touch back-channel (Milestone 3). Needs Accessibility trust;
-            // streaming works without it, so don't interrupt with a prompt —
-            // the permission panel's Grant button asks when the user is ready.
+            // Touch back-channel (Milestone 3) is optional. macOS Accessibility
+            // access is unnecessary for a display-only receiver such as a TV;
+            // never hold an otherwise working extended desktop open waiting
+            // for that unrelated permission.
             if !AXIsProcessTrusted() {
-                await status("Extending — grant Accessibility for touch input")
-                // Event posting is trust-checked per-post, so it starts working
-                // the moment the user grants — poll just to log/report it.
-                while !AXIsProcessTrusted() {
-                    try await Task.sleep(for: .seconds(2))
-                    if stopped { return }
-                }
-                Log.info("Accessibility permission granted — touch input live")
+                Log.info("Accessibility not granted; display remains available without touch input")
             }
         }
     }
@@ -1762,13 +1760,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("connection path to \(endpointName): \(names) wired=\(wired) direct=\(currentPathDirectLink)")
             Task { @MainActor in self.onTransportPath?(wired) }
         }
-        // -forceUpgradeProbe YES: dev knob — loopback runs never look like
-        // WiFi, so this is the only way to exercise probe+migrate on one Mac.
-        if currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe") {
-            startUpgradeProbing()
-        } else {
-            stopUpgradeProbing()   // already off WiFi — nothing better to find
-        }
+        // The secured Xiaomi receiver is Wi-Fi only. Do not run the legacy
+        // plaintext cable probe or migrate this TLS session to an unapproved path.
+        stopUpgradeProbing()
         Task { await self.status("Connected to \(self.endpointName)") }
     }
 
@@ -1992,8 +1986,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // there is one (field-tested: en10 chosen over en0). A WiFi-prohibited
         // pre-dial was tried and only ever hung until its timeout, adding 2s
         // to every connect. becomeReady reports which path won.
-        let params = NWParameters(tls: nil, tcp: options)
+        let tlsOptions = secureTLSOptions()
+        let params = NWParameters(tls: tlsOptions, tcp: options)
+        // Xiaomi/Android receivers can advertise several stale or unreachable
+        // IPv6 addresses through Bonjour. Prefer the active LAN IPv4 path.
+        (params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options)?.version = .v4
         let conn = NWConnection(to: endpoint, using: params)
+        Log.info("TLS dial starting: \(endpoint)")
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app
         // closed) sits in .preparing forever — it neither fails nor resolves
@@ -2002,7 +2001,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Bonjour resolution, so the retry loop reaches the receiver the
         // moment it advertises again.
         let generation = dialGeneration
-        queue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+        queue.asyncAfter(deadline: .now() + 15.0) { [weak self] in
             guard let self, generation == self.dialGeneration, !self.stopped,
                   self.connection === conn, conn.state != .ready else { return }
             Log.info("dial timed out in \(conn.state) — redialing")
@@ -2012,7 +2011,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self else { return }
             switch state {
             case .ready:
-                self.becomeReady(conn)
+                Log.info("TLS dial ready: \(endpoint)")
+                self.authorizeSecureConnection(conn)
             case .failed(let error):
                 Log.info("connection failed: \(error)")
                 self.connectionReady = false
@@ -2043,6 +2043,197 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         conn.start(queue: queue)
+    }
+
+    private func secureTLSOptions() -> NWProtocolTLS.Options {
+        let tls = NWProtocolTLS.Options()
+        // Both peers use locally generated certificates, so system PKI trust
+        // evaluation is not applicable. Extract and pin the TV certificate
+        // directly from secTrust inside the verify block, because post-handshake
+        // SSL_SESSION does not cache peer certificates in BoringSSL.
+        sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { [weak self] _, secTrust, complete in
+            guard let self else { complete(false); return }
+            let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
+            if let cert = SecTrustGetCertificateAtIndex(trust, 0) {
+                let data = SecCertificateCopyData(cert) as Data
+                let fingerprint = PairingIdentity.fingerprint(data)
+                self.queue.async {
+                    self.verifiedReceiverFingerprint = fingerprint
+                }
+                Log.info("TLS receiver certificate verified: \(fingerprint.prefix(8))...")
+                complete(true)
+            } else {
+                Log.info("TLS verify block received no peer certificate")
+                complete(false)
+            }
+        }, queue)
+        return tls
+    }
+
+    /// Verify/pair the TV and complete the token exchange before enabling any
+    /// OpenDisplay control or video messages on this TLS connection.
+    private func authorizeSecureConnection(_ conn: NWConnection) {
+        let receiverFingerprint = self.verifiedReceiverFingerprint ?? peerFingerprint(conn)
+        guard connection === conn, let receiverFingerprint else {
+            Log.info("TLS ready without a usable receiver certificate")
+            conn.cancel()
+            scheduleReconnect()
+            return
+        }
+        do {
+            let identity = try PairingIdentity.loadOrCreate()
+            if let trusted = try PairingIdentity.trustedPeer() {
+                guard trusted.fingerprint == receiverFingerprint else {
+                    Task { await status("Receiver identity changed; pairing was rejected") }
+                    conn.cancel()
+                    scheduleReconnect()
+                    return
+                }
+                if trusted.isPaired {
+                    sendSecureAuth(conn, mode: "resume", identity: identity,
+                                   receiverFingerprint: receiverFingerprint,
+                                   token: trusted.token, code: nil, trustedPeer: trusted)
+                } else {
+                    promptAndPair(conn, identity: identity, receiverFingerprint: receiverFingerprint,
+                                  token: trusted.token)
+                }
+            } else {
+                promptAndPair(conn, identity: identity, receiverFingerprint: receiverFingerprint,
+                              token: try PairingIdentity.makeToken())
+            }
+        } catch {
+            Task { await status("Secure identity error: \(error.localizedDescription)") }
+            conn.cancel()
+            scheduleReconnect()
+        }
+    }
+
+    private func promptAndPair(_ conn: NWConnection, identity: PairingIdentity,
+                               receiverFingerprint: String, token: String) {
+        let code = PairingIdentity.comparisonCode(identity.fingerprint, receiverFingerprint)
+        Task { @MainActor in
+            guard let prompt = self.onPairingPrompt, prompt(code, receiverFingerprint) else {
+                self.queue.async { conn.cancel() }
+                self.onPairingDeclined?()
+                return
+            }
+            self.queue.async {
+                guard self.connection === conn else { return }
+                do {
+                    let pending = PairingIdentity.TrustedPeer(fingerprint: receiverFingerprint,
+                                                              token: token, isPaired: false)
+                    // Persist before sending: if the TV's approval response is
+                    // lost, the retry uses this same secret and code.
+                    try PairingIdentity.saveTrustedPeer(pending)
+                    Task { await self.status("Waiting for TV approval · code \(code)") }
+                    self.sendSecureAuth(conn, mode: "pair", identity: identity,
+                                        receiverFingerprint: receiverFingerprint,
+                                        token: token, code: code, trustedPeer: pending)
+                } catch {
+                    Task { await self.status("Pairing could not be saved: \(error.localizedDescription)") }
+                    conn.cancel()
+                }
+            }
+        }
+    }
+
+    private func peerFingerprint(_ conn: NWConnection) -> String? {
+        guard let tlsMetadata = conn.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata
+        else { return nil }
+        var result: String?
+        _ = sec_protocol_metadata_access_peer_certificate_chain(tlsMetadata.securityProtocolMetadata) { cert in
+            guard result == nil else { return }
+            let secCert = sec_certificate_copy_ref(cert).takeRetainedValue()
+            result = PairingIdentity.fingerprint(SecCertificateCopyData(secCert) as Data)
+        }
+        return result
+    }
+
+    private func sendSecureAuth(_ conn: NWConnection, mode: String,
+                                identity: PairingIdentity,
+                                receiverFingerprint: String,
+                                token: String,
+                                code: String?,
+                                trustedPeer: PairingIdentity.TrustedPeer) {
+        var request: [String: Any] = [
+            "type": "secureAuth", "secureVersion": 1, "mode": mode,
+            "macFingerprint": identity.fingerprint,
+            "macName": Host.current().localizedName ?? "Mac",
+            "token": token,
+        ]
+        if let code { request["comparisonCode"] = code }
+        guard let payload = try? JSONSerialization.data(withJSONObject: request) else {
+            conn.cancel()
+            return
+        }
+        var length = UInt32(payload.count).bigEndian
+        var frame = Data(bytes: &length, count: 4)
+        frame.append(payload)
+        conn.send(content: frame, completion: .contentProcessed { [weak self] error in
+            guard let self, self.connection === conn else { return }
+            if let error {
+                Log.info("secure auth send failed: \(error)")
+                conn.cancel()
+                self.scheduleReconnect()
+                return
+            }
+            self.readSecureReady(conn, trustedPeer: trustedPeer, mode: mode)
+        })
+    }
+
+    private func readSecureReady(_ conn: NWConnection, trustedPeer: PairingIdentity.TrustedPeer,
+                                 mode: String) {
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] header, _, _, error in
+            guard let self, self.connection === conn, error == nil, let header, header.count == 4 else {
+                conn.cancel()
+                self?.scheduleReconnect()
+                return
+            }
+            let length = Int(UInt32(bigEndian: header.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
+            guard (1..<32768).contains(length) else { conn.cancel(); return }
+            conn.receive(minimumIncompleteLength: length, maximumLength: length) { payload, _, _, error in
+                guard self.connection === conn, error == nil, let payload,
+                      let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                      obj["type"] as? String == "secureReady" else {
+                    conn.cancel()
+                    self.scheduleReconnect()
+                    return
+                }
+                guard obj["ok"] as? Bool == true else {
+                    let reason = obj["reason"] as? String ?? "pairing_rejected"
+                    let detail: String
+                    switch reason {
+                    case "version_mismatch": detail = "TV secure protocol is incompatible — update both apps"
+                    case "comparison_mismatch": detail = "Pairing codes did not match — pairing cancelled"
+                    case "pairing_declined": detail = "TV declined pairing — connect again when ready"
+                    case "pairing_missing": detail = "TV forgot this Mac — forget the TV here, then pair again"
+                    case "already_paired": detail = "A different Mac is paired — forget it in TV Settings first"
+                    default:
+                        detail = mode == "resume"
+                            ? "TV no longer trusts this Mac — forget the TV here, then pair again"
+                            : "TV rejected pairing — connect again when both screens are ready"
+                    }
+                    if reason == "pairing_missing" || reason == "pairing_declined" {
+                        try? PairingIdentity.forgetTrustedPeer()
+                    }
+                    Log.info("receiver rejected secure authentication: \(detail)")
+                    Task { @MainActor in
+                        await self.status(detail)
+                        if reason == "pairing_declined" || reason == "comparison_mismatch" || reason == "version_mismatch" {
+                            self.onPairingDeclined?()
+                        }
+                    }
+                    conn.cancel()
+                    self.scheduleReconnect()
+                    return
+                }
+                let paired = PairingIdentity.TrustedPeer(fingerprint: trustedPeer.fingerprint,
+                                                         token: trustedPeer.token, isPaired: true)
+                do { try PairingIdentity.saveTrustedPeer(paired) }
+                catch { Log.info("could not persist paired receiver identity: \(error)") }
+                self.becomeReady(conn)
+            }
+        }
     }
 
     /// Dial over the cable: macOS's built-in usbmuxd for iPhones and iPads,

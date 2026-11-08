@@ -10,6 +10,9 @@ import Foundation
 /// never trigger a compatibility event. A peer that advertises no version is
 /// protocol 1 — that's every install in the field that predates the handshake.
 enum WireProtocol {
+    /// Private authenticated fork port; different from OpenDisplay pv3 so an
+    /// unmodified plaintext receiver can never be mistaken for this service.
+    static let secureWiFiPort = 9443
     /// The protocol version this build speaks.
     static let version = 3
 
